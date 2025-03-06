@@ -1,0 +1,14 @@
+server:
+  port: 8080
+spring:
+  cloud:
+    gateway:
+      routes:
+        - id: Login-Service
+          uri: lb://Login-Service
+          Predicates:
+            - Path=/auth/**
+        - id: Assessment-App
+          uri: http://localhost:8082
+          Predicates:
+            - Path=/api/v1/**
