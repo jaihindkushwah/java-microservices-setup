@@ -1,0 +1,1208 @@
+// const cluster = require("cluster");
+// const os = require("os");
+// const mysql = require("mysql2/promise");
+// const express = require("express");
+// const { processDataAndGeneratePDF } = require("./testpdf.js");
+// const { PDFDocument } = require("pdf-lib");
+// const QRcode = require("qrcode");
+// const winston = require("winston");
+// const path = require("path");
+// const fs = require("fs");
+
+// // Always use 16 cores for processing
+// // Constants
+// const MAX_WORKERS = 16; // Maximum workers
+// const NUM_WORKERS = Math.min(os.cpus().length, MAX_WORKERS); // Use max 16 workers
+// const FIXED_BATCH_SIZE = 100; // Consistent batch size
+// const PARALLEL_PROCESSES = 10; // Consistent parallel processing count
+// const WAIT_BETWEEN_BATCHES = 30000;
+// const WORKER_TIMEOUT = 5 * 60 * 1000; // 5 minutes
+
+// // Persistent state management
+// const STATE_FILE = path.join(__dirname, "processing_state.json");
+
+// // Enhanced logging setup
+// const logDirectory = path.join(__dirname, "logs");
+// if (!fs.existsSync(logDirectory)) {
+//   fs.mkdirSync(logDirectory, { recursive: true });
+// }
+
+// const logger = winston.createLogger({
+//   level: "info",
+//   format: winston.format.combine(
+//     winston.format.timestamp(),
+//     winston.format.printf(({ timestamp, level, message }) => {
+//       return `${timestamp} [${level.toUpperCase()}]: ${message}`;
+//     })
+//   ),
+//   transports: [
+//     new winston.transports.Console(),
+//     new winston.transports.File({
+//       filename: `${logDirectory}/app.log`,
+//       maxsize: 10485760, // 10MB
+//       maxFiles: 10,
+//       tailable: true,
+//     }),
+//     new winston.transports.File({
+//       filename: `${logDirectory}/error.log`,
+//       level: "error",
+//       maxsize: 10485760, // 10MB
+//       maxFiles: 10,
+//     }),
+//   ],
+// });
+
+// // Optimized database pool for 16-core system
+// const pool = mysql.createPool({
+//   host: "localhost",
+//   user: "root",
+//   password: "123456",
+//   database: "mgl_centralise_pdf",
+//   waitForConnections: true,
+//   connectionLimit: NUM_WORKERS * 3,
+//   queueLimit: 0,
+//   enableKeepAlive: true,
+//   keepAliveInitialDelay: 10000,
+//   namedPlaceholders: true,
+// });
+
+// // Utility functions for state management
+// function saveProcessingState(state) {
+//   try {
+//     fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2));
+//     logger.info("Processing state saved successfully");
+//   } catch (error) {
+//     logger.error(`Failed to save processing state: ${error.message}`);
+//   }
+// }
+
+// function loadProcessingState() {
+//   try {
+//     if (fs.existsSync(STATE_FILE)) {
+//       const rawState = fs.readFileSync(STATE_FILE, "utf8");
+//       return JSON.parse(rawState);
+//     }
+//   } catch (error) {
+//     logger.error(`Failed to load processing state: ${error.message}`);
+//   }
+//   return null;
+// }
+
+// function clearProcessingState() {
+//   try {
+//     if (fs.existsSync(STATE_FILE)) {
+//       fs.unlinkSync(STATE_FILE);
+//       logger.info("Processing state cleared");
+//     }
+//   } catch (error) {
+//     logger.error(`Failed to clear processing state: ${error.message}`);
+//   }
+// }
+
+// if (cluster.isMaster) {
+//   logger.info(`Master ${process.pid} is running with ${NUM_WORKERS} workers`);
+
+//   // Tracking variables
+//   let totalProcessed = 0;
+//   let totalToProcess = 0;
+//   let activeWorkers = new Set();
+
+//   // Worker tracking
+//   let workerProgress = {};
+//   let workerTasks = {};
+//   let unassignedTasks = [];
+
+//   logger.info(
+//     `Master ${process.pid} running with up to ${NUM_WORKERS} workers`
+//   );
+
+//   const app = express();
+//   function forkWorker(workerId, initialOffset, savedState) {
+//     const worker = cluster.fork({
+//       WORKER_ID: workerId,
+//       TOTAL_RECORDS: totalToProcess,
+//       NUM_WORKERS: NUM_WORKERS,
+//       INITIAL_OFFSET: initialOffset,
+//     });
+
+//     activeWorkers.add(worker.id);
+//     workerTasks[worker.id] = [];
+
+//     workerProgress[workerId] = {
+//       processed: savedState?.workerProgress?.[workerId]?.processed || 0,
+//       lastOffset: savedState?.workerProgress?.[workerId]?.lastOffset || 0,
+//     };
+
+//     worker.on("message", (msg) => {
+//       if (msg.type === "progress") {
+//         workerProgress[msg.workerId] = {
+//           processed: msg.processed,
+//           lastOffset: msg.lastOffset,
+//         };
+
+//         totalProcessed = Object.values(workerProgress).reduce(
+//           (sum, w) => sum + w.processed,
+//           0
+//         );
+
+//         saveProcessingState({
+//           totalProcessed,
+//           totalToProcess,
+//           workerProgress,
+//           lastProcessedOffset: Math.max(
+//             ...Object.values(workerProgress).map((w) => w.lastOffset)
+//           ),
+//           lastUpdate: new Date().toISOString(),
+//         });
+
+//         logger.info(
+//           `Progress: ${totalProcessed}/${totalToProcess} (${Math.round(
+//             (totalProcessed / totalToProcess) * 100
+//           )}%)`
+//         );
+//       }
+//     });
+
+//     worker.on("exit", (code, signal) => {
+//       if (code === 0 && signal === null) {
+//         logger.info(
+//           `✅ Worker ${worker.process.pid} (ID: ${worker.id}) exited normally.`
+//         );
+//       } else {
+//         logger.warn(
+//           `⚠️ Worker ${worker.process.pid} (ID: ${worker.id}) exited unexpectedly (code: ${code}, signal: ${signal}).`
+//         );
+
+//         // Only respawn workers that didn't exit normally
+//         // This ensures workers that completed their tasks don't get respawned
+//         if (
+//           activeWorkers.size < NUM_WORKERS &&
+//           totalProcessed < totalToProcess
+//         ) {
+//           logger.info(
+//             `Respawning worker to maintain ${NUM_WORKERS} active workers...`
+//           );
+//           forkWorker(worker.id, workerProgress[worker.id]?.lastOffset || 0, {
+//             workerProgress,
+//           });
+//         }
+//       }
+
+//       activeWorkers.delete(worker.id);
+
+//       // Check if all records are processed
+//       if (totalProcessed >= totalToProcess) {
+//         logger.info(
+//           "✅ All PDFs have been generated. No need to respawn workers."
+//         );
+
+//         if (activeWorkers.size === 0) {
+//           logger.info(
+//             `✅ Final progress: ${totalProcessed}/${totalToProcess} PDFs generated.`
+//           );
+//           clearProcessingState();
+//         }
+//       }
+//     });
+//   }
+
+//   // function redistributeTasks(failedWorkerId) {
+//   //   logger.warn(`Redistributing tasks for failed worker ${failedWorkerId}`);
+
+//   //   if (workerTasks[failedWorkerId]) {
+//   //     unassignedTasks.push(...workerTasks[failedWorkerId]);
+//   //     delete workerTasks[failedWorkerId];
+//   //   }
+
+//   //   if (activeWorkers.size > 0) {
+//   //     const activeWorkerIds = [...activeWorkers];
+//   //     while (unassignedTasks.length > 0) {
+//   //       const selectedWorkerId =
+//   //         activeWorkerIds[Math.floor(Math.random() * activeWorkerIds.length)];
+//   //       const task = unassignedTasks.pop();
+//   //       workerTasks[selectedWorkerId].push(task);
+//   //       cluster.workers[selectedWorkerId]?.send({ type: "assign_task", task });
+//   //     }
+//   //   }
+//   // }
+//   function redistributeTasks(failedWorkerId) {
+//     logger.warn(`Redistributing tasks for failed worker ${failedWorkerId}`);
+
+//     if (workerTasks[failedWorkerId]) {
+//       unassignedTasks.push(...workerTasks[failedWorkerId]);
+//       delete workerTasks[failedWorkerId];
+//     }
+
+//     if (activeWorkers.size > 0) {
+//       const activeWorkerIds = [...activeWorkers];
+//       while (unassignedTasks.length > 0) {
+//         const selectedWorkerId =
+//           activeWorkerIds[Math.floor(Math.random() * activeWorkerIds.length)];
+//         const task = unassignedTasks.pop();
+
+//         // Ensure workerTasks exists for the worker
+//         if (!workerTasks[selectedWorkerId]) {
+//           workerTasks[selectedWorkerId] = [];
+//         }
+
+//         workerTasks[selectedWorkerId].push(task);
+//         cluster.workers[selectedWorkerId]?.send({ type: "assign_task", task });
+//       }
+//     }
+
+//     // **Stop workers with no tasks left**
+//     for (const workerId of activeWorkers) {
+//       if (!workerTasks[workerId] || workerTasks[workerId].length === 0) {
+//         logger.info(`Worker ${workerId} has no tasks left, stopping.`);
+//         cluster.workers[workerId]?.kill();
+//         activeWorkers.delete(workerId);
+//         delete workerTasks[workerId];
+//       }
+//     }
+//   }
+
+//   app.get("/process-data", async (req, res) => {
+//     logger.info("Received request to process data.");
+
+//     try {
+//       // Check for existing processing state
+//       const savedState = loadProcessingState();
+
+//       // Get total count of records to process
+//       const connection = await pool.getConnection();
+//       const [result] = await connection.query(
+//         "SELECT COUNT(*) AS total FROM currbill1 WHERE isDeleted = '0' AND create_date >= CURDATE()"
+//       );
+//       connection.release();
+
+//       totalToProcess = result[0].total;
+//       // totalToProcess = 1600;
+//       logger.info(`Total records to process: ${totalToProcess}`);
+
+//       // Determine starting point
+//       const initialOffset = savedState ? savedState.lastProcessedOffset : 0;
+//       logger.info(`Starting processing from offset: ${initialOffset}`);
+
+//       for (let i = 0; i < NUM_WORKERS; i++) {
+//         forkWorker(i, initialOffset, savedState);
+//       }
+
+//       res.send(
+//         `Processing started for ${totalToProcess} records with ${NUM_WORKERS} workers, starting from offset ${initialOffset}.`
+//       );
+//     } catch (error) {
+//       logger.error(`Error starting processing: ${error.message}`);
+//       res.status(500).send(`Error: ${error.message}`);
+//     }
+//   });
+
+//   // Endpoint to reset processing
+//   app.get("/reset-processing", (req, res) => {
+//     clearProcessingState();
+//     res.send("Processing state has been reset.");
+//   });
+//   app.get("/stop-all-workers", (req, res) => {
+//     activeWorkers.forEach((workerId) => {
+//       const worker = cluster.workers[workerId]; // Get the worker from cluster
+
+//       if (worker) {
+//         worker.kill(); // Stop the worker process
+//         console.log(`Worker ${workerId} stopped.`);
+//       }
+
+//       activeWorkers.delete(workerId); // Remove from active set
+//     });
+
+//     res.send("All workers stopped.");
+//   });
+
+//   //   // Status endpoint
+//   app.get("/status", (req, res) => {
+//     res.json({
+//       activeWorkers,
+//       totalProcessed,
+//       totalToProcess,
+//       unassignedTasks: unassignedTasks.length,
+//       percentComplete: totalToProcess
+//         ? Math.round((totalProcessed / totalToProcess) * 100)
+//         : 0,
+//       workerProgress,
+//     });
+//   });
+
+//   // Endpoint: Check worker status
+//   app.get("/worker-status", (req, res) => {
+//     res.json({
+//       activeWorkers: [...activeWorkers],
+//       workerTasks,
+//     });
+//   });
+
+//   app.listen(9001, () => logger.info("Master server running on port 9001"));
+//   process.on("SIGINT", () => {
+//     logger.info("Shutting down gracefully...");
+//     pool.end();
+//     process.exit(0);
+//   });
+// } else {
+//   // Worker process
+//   logger.info(`Worker ${process.pid} started`);
+
+//   const processWorkerData = async () => {
+//     let connection;
+//     try {
+//       const workerId = parseInt(process.env.WORKER_ID, 10);
+//       const totalRecords = parseInt(process.env.TOTAL_RECORDS, 10);
+//       const numWorkers = parseInt(process.env.NUM_WORKERS, 10);
+//       const initialOffset = parseInt(process.env.INITIAL_OFFSET, 10) || 0;
+
+//       // Calculate worker's portion of records
+//       const recordsPerWorker = Math.ceil(totalRecords / numWorkers);
+//       const startOffset = Math.max(initialOffset, workerId * recordsPerWorker);
+//       const endOffset = Math.min(
+//         (workerId + 1) * recordsPerWorker,
+//         totalRecords
+//       );
+
+//       logger.info(
+//         `Worker ${workerId}: Processing ${
+//           endOffset - startOffset
+//         } records from ${startOffset} to ${endOffset}`
+//       );
+
+//       let processed = 0;
+
+//       // Process records in batches
+//       for (
+//         let offset = startOffset;
+//         offset < endOffset;
+//         offset += FIXED_BATCH_SIZE
+//       ) {
+//         let rows = []; // ✅ Declare `rows` outside try block
+
+//         try {
+//           connection = await pool.getConnection();
+
+//           // Calculate current batch size
+//           const currentBatchSize = Math.min(
+//             FIXED_BATCH_SIZE,
+//             endOffset - offset
+//           );
+
+//           // Fetch batch of data
+//           [rows] = await connection.query(
+//             `SELECT * FROM currbill1
+//                WHERE isDeleted = '0'
+//                AND create_date >= CURDATE()
+//                ORDER BY bill_no
+//                LIMIT ? OFFSET ?`,
+//             [currentBatchSize, offset]
+//           );
+//         } catch (error) {
+//           logger.error(
+//             `Worker ${workerId} error fetching batch: ${error.message}`
+//           );
+//           throw error;
+//         } finally {
+//           if (connection) {
+//             connection.release();
+//             connection = null;
+//           }
+//         }
+
+//         // ✅ If no rows were found, move to the next batch
+//         if (rows.length === 0) {
+//           logger.info(
+//             `Worker ${workerId}: No records found in batch at offset ${offset}`
+//           );
+//           continue;
+//         }
+
+//         // Process in chunks with parallelism
+//         for (let i = 0; i < rows.length; i += PARALLEL_PROCESSES) {
+//           const chunk = rows.slice(i, i + PARALLEL_PROCESSES);
+
+//           await Promise.all(
+//             chunk.map(async (row) => {
+//               try {
+//                 await processDataAndGeneratePDF(QRcode, PDFDocument, [row]);
+//                 processed++;
+
+//                 // Update progress occasionally
+//                 if (processed % 20 === 0) {
+//                   process.send({
+//                     type: "progress",
+//                     workerId,
+//                     processed,
+//                     lastOffset: offset + i + 1,
+//                   });
+//                 }
+//               } catch (err) {
+//                 logger.error(
+//                   `Error processing row in Worker ${workerId}: ${err.message}`
+//                 );
+//               }
+//             })
+//           );
+
+//           // Short wait between chunks to avoid overwhelming system
+//           await wait(2000);
+//         }
+
+//         // Update progress after each batch
+//         process.send({
+//           type: "progress",
+//           workerId,
+//           processed,
+//           lastOffset: offset + rows.length,
+//         });
+
+//         // 🛑 Wait 30 seconds after batch completion
+//         logger.info(
+//           `Worker ${workerId} completed batch, waiting 30 seconds...`
+//         );
+//         await wait(WAIT_BETWEEN_BATCHES);
+
+//         // 🧹 Force garbage collection (if enabled)
+//         if (global.gc) {
+//           logger.info(`Worker ${workerId} running garbage collection...`);
+//           global.gc();
+//         }
+//       }
+
+//       logger.info(
+//         `Worker ${workerId} finished processing. Total processed: ${processed}`
+//       );
+//       process.exit(0);
+//     } catch (error) {
+//       logger.error(
+//         `Worker ${process.pid} encountered an error: ${error.message}`
+//       );
+//       process.exit(1);
+//     }
+//   };
+
+//   process.on("message", (msg) => {
+//     if (msg.type === "assign_task") {
+//       logger.info(`Worker ${workerId} received an additional task`);
+//     }
+//   });
+
+//   // Start processing
+//   processWorkerData();
+// }
+
+// function wait(ms) {
+//   logger.info("Waiting for" + ms + "milliseconds...");
+//   return new Promise((resolve) => setTimeout(resolve, ms));
+// }
+// module.exports = {
+//   saveProcessingState,
+//   loadProcessingState,
+//   clearProcessingState,
+// };
+
+const cluster = require("cluster");
+const os = require("os");
+const mysql = require("mysql2/promise");
+const express = require("express");
+const { processDataAndGeneratePDF } = require("./testpdf.js");
+const { PDFDocument } = require("pdf-lib");
+const QRcode = require("qrcode");
+const winston = require("winston");
+const path = require("path");
+const fs = require("fs");
+
+// Always use 16 cores for processing
+// Constants
+const MAX_WORKERS = 16; // Maximum workers
+const NUM_WORKERS = Math.min(os.cpus().length, MAX_WORKERS); // Use max 16 workers
+const FIXED_BATCH_SIZE = 100; // Initial batch size
+const MIN_BATCH_SIZE = 50; // Minimum batch size
+const MAX_BATCH_SIZE = 200; // Maximum batch size
+const PARALLEL_PROCESSES = 10; // Consistent parallel processing count
+const WAIT_BETWEEN_BATCHES = 30000;
+const WORKER_TIMEOUT = 5 * 60 * 1000; // 5 minutes
+const HEARTBEAT_CHECK_INTERVAL = 60000; // Check worker health every minute
+const MAX_CONSECUTIVE_EMPTY_BATCHES = 3; // Number of empty batches before assuming no more data
+const MEMORY_THRESHOLD = 1.5 * 1024 * 1024 * 1024; // 1.5GB
+
+// Persistent state management
+const STATE_FILE = path.join(__dirname, "processing_state.json");
+
+// Enhanced logging setup
+const logDirectory = path.join(__dirname, "logs");
+if (!fs.existsSync(logDirectory)) {
+  fs.mkdirSync(logDirectory, { recursive: true });
+}
+
+const logger = winston.createLogger({
+  level: "info",
+  format: winston.format.combine(
+    winston.format.timestamp(),
+    winston.format.printf(({ timestamp, level, message }) => {
+      return `${timestamp} [${level.toUpperCase()}]: ${message}`;
+    })
+  ),
+  transports: [
+    new winston.transports.Console(),
+    new winston.transports.File({
+      filename: `${logDirectory}/app.log`,
+      maxsize: 10485760, // 10MB
+      maxFiles: 10,
+      tailable: true,
+    }),
+    new winston.transports.File({
+      filename: `${logDirectory}/error.log`,
+      level: "error",
+      maxsize: 10485760, // 10MB
+      maxFiles: 10,
+    }),
+  ],
+});
+
+// Optimized database pool for 16-core system
+const pool = mysql.createPool({
+  host: "localhost",
+  user: "root",
+  password: "123456",
+  database: "mgl_centralise_pdf",
+  waitForConnections: true,
+  connectionLimit: NUM_WORKERS * 3,
+  queueLimit: 0,
+  enableKeepAlive: true,
+  keepAliveInitialDelay: 10000,
+  namedPlaceholders: true,
+});
+
+// Utility functions for state management
+function saveProcessingState(state) {
+  try {
+    fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2));
+    logger.info("Processing state saved successfully");
+  } catch (error) {
+    logger.error(`Failed to save processing state: ${error.message}`);
+  }
+}
+
+function loadProcessingState() {
+  try {
+    if (fs.existsSync(STATE_FILE)) {
+      const rawState = fs.readFileSync(STATE_FILE, "utf8");
+      return JSON.parse(rawState);
+    }
+  } catch (error) {
+    logger.error(`Failed to load processing state: ${error.message}`);
+  }
+  return null;
+}
+
+function clearProcessingState() {
+  try {
+    if (fs.existsSync(STATE_FILE)) {
+      fs.unlinkSync(STATE_FILE);
+      logger.info("Processing state cleared");
+    }
+  } catch (error) {
+    logger.error(`Failed to clear processing state: ${error.message}`);
+  }
+}
+
+if (cluster.isMaster) {
+  logger.info(`Master ${process.pid} is running with ${NUM_WORKERS} workers`);
+
+  // Tracking variables
+  let totalProcessed = 0;
+  let totalToProcess = 0;
+  let activeWorkers = new Set();
+
+  // Worker tracking
+  let workerProgress = {};
+  let workerTasks = {};
+  let unassignedTasks = [];
+  let heartbeatIntervals = {};
+
+  logger.info(
+    `Master ${process.pid} running with up to ${NUM_WORKERS} workers`
+  );
+
+  const app = express();
+
+  function forkWorker(workerId, initialOffset, savedState) {
+    const worker = cluster.fork({
+      WORKER_ID: workerId,
+      TOTAL_RECORDS: totalToProcess,
+      NUM_WORKERS: NUM_WORKERS,
+      INITIAL_OFFSET: initialOffset,
+    });
+
+    activeWorkers.add(worker.id);
+    workerTasks[worker.id] = [];
+
+    // Initialize worker progress
+    workerProgress[workerId] = {
+      processed: savedState?.workerProgress?.[workerId]?.processed || 0,
+      lastOffset: savedState?.workerProgress?.[workerId]?.lastOffset || 0,
+      lastUpdateTime: Date.now(), // Track last time we heard from this worker
+      expectedBatchEndTime: Date.now() + WORKER_TIMEOUT, // When current batch should complete by
+      currentBatchSize: FIXED_BATCH_SIZE, // Track current batch size for adaptive timing
+      processingTimes: [], // Track recent processing times
+    };
+
+    // Set up heartbeat monitoring
+    heartbeatIntervals[worker.id] = setInterval(() => {
+      const lastUpdateTime =
+        workerProgress[workerId]?.lastUpdateTime || Date.now();
+      const idleTime = Date.now() - lastUpdateTime;
+
+      if (idleTime > WORKER_TIMEOUT) {
+        logger.warn(
+          `Worker ${worker.id} appears to be stuck (idle for ${Math.round(
+            idleTime / 1000
+          )}s). Terminating.`
+        );
+        worker.kill("SIGTERM");
+        clearInterval(heartbeatIntervals[worker.id]);
+        delete heartbeatIntervals[worker.id];
+      }
+    }, HEARTBEAT_CHECK_INTERVAL);
+
+    worker.on("message", (msg) => {
+      if (msg.type === "progress") {
+        // Update progress tracking
+        const batchProcessingTime =
+          Date.now() -
+          (workerProgress[msg.workerId]?.batchStartTime || Date.now());
+
+        // Update worker progress data
+        workerProgress[msg.workerId] = {
+          ...workerProgress[msg.workerId],
+          processed: msg.processed,
+          lastOffset: msg.lastOffset,
+          lastUpdateTime: Date.now(),
+          expectedBatchEndTime: Date.now() + WORKER_TIMEOUT,
+        };
+
+        // Track processing times for adaptive batch sizing
+        if (msg.batchComplete && batchProcessingTime > 0) {
+          const times = workerProgress[msg.workerId].processingTimes || [];
+          times.push(batchProcessingTime);
+
+          // Keep last 5 processing times
+          if (times.length > 5) times.shift();
+          workerProgress[msg.workerId].processingTimes = times;
+
+          // Calculate average processing time
+          const avgTime = times.reduce((a, b) => a + b, 0) / times.length;
+
+          // Adjust batch size based on processing time
+          let newBatchSize =
+            workerProgress[msg.workerId].currentBatchSize || FIXED_BATCH_SIZE;
+
+          if (avgTime < 30000 && newBatchSize < MAX_BATCH_SIZE) {
+            newBatchSize = Math.min(MAX_BATCH_SIZE, newBatchSize + 10);
+            logger.info(
+              `Worker ${
+                msg.workerId
+              } batch size increased to ${newBatchSize} (avg processing time: ${Math.round(
+                avgTime / 1000
+              )}s)`
+            );
+          } else if (avgTime > 60000 && newBatchSize > MIN_BATCH_SIZE) {
+            newBatchSize = Math.max(MIN_BATCH_SIZE, newBatchSize - 10);
+            logger.info(
+              `Worker ${
+                msg.workerId
+              } batch size decreased to ${newBatchSize} (avg processing time: ${Math.round(
+                avgTime / 1000
+              )}s)`
+            );
+          }
+
+          workerProgress[msg.workerId].currentBatchSize = newBatchSize;
+          worker.send({ type: "adjust_batch_size", batchSize: newBatchSize });
+        }
+
+        // Check memory usage if reported
+        if (msg.memoryUsage && msg.memoryUsage.heapUsed > MEMORY_THRESHOLD) {
+          logger.warn(
+            `Worker ${msg.workerId} memory usage high: ${Math.round(
+              msg.memoryUsage.heapUsed / 1024 / 1024
+            )}MB`
+          );
+        }
+
+        // Calculate total progress
+        totalProcessed = Object.values(workerProgress).reduce(
+          (sum, w) => sum + w.processed,
+          0
+        );
+
+        // Save state
+        saveProcessingState({
+          totalProcessed,
+          totalToProcess,
+          workerProgress,
+          lastProcessedOffset: Math.max(
+            0, // Default to 0 if no offsets exist
+            ...Object.values(workerProgress).map((w) => w.lastOffset || 0)
+          ),
+          lastUpdate: new Date().toISOString(),
+        });
+
+        // Log progress
+        logger.info(
+          `Progress: ${totalProcessed}/${totalToProcess} (${Math.round(
+            (totalProcessed / totalToProcess) * 100
+          )}%)`
+        );
+      } else if (msg.type === "no_data") {
+        // Handle case where worker found no data to process
+        logger.info(
+          `Worker ${msg.workerId} found no data to process in its range`
+        );
+
+        // Mark this worker as completed
+        workerProgress[msg.workerId] = {
+          ...workerProgress[msg.workerId],
+          processed: msg.processed || 0,
+          lastOffset: msg.lastOffset || 0,
+          lastUpdateTime: Date.now(),
+          completed: true, // Mark as completed
+        };
+      } else if (msg.type === "batch_start") {
+        // Track when batch processing started
+        workerProgress[msg.workerId] = {
+          ...workerProgress[msg.workerId],
+          batchStartTime: Date.now(),
+          expectedBatchEndTime: Date.now() + WORKER_TIMEOUT,
+        };
+      }
+    });
+
+    worker.on("exit", (code, signal) => {
+      // Clean up monitoring
+      if (heartbeatIntervals[worker.id]) {
+        clearInterval(heartbeatIntervals[worker.id]);
+        delete heartbeatIntervals[worker.id];
+      }
+
+      if (code === 0 && signal === null) {
+        logger.info(
+          `✅ Worker ${worker.process.pid} (ID: ${worker.id}) exited normally.`
+        );
+      } else {
+        logger.warn(
+          `⚠️ Worker ${worker.process.pid} (ID: ${worker.id}) exited unexpectedly (code: ${code}, signal: ${signal}).`
+        );
+
+        // Check if there might be remaining work to do
+        const workerData = workerProgress[workerId] || {};
+        const isCompleted = workerData.completed === true;
+
+        // Only respawn workers that didn't exit normally AND aren't marked as completed
+        if (
+          activeWorkers.size < NUM_WORKERS &&
+          totalProcessed < totalToProcess &&
+          !isCompleted
+        ) {
+          logger.info(
+            `Respawning worker to maintain ${NUM_WORKERS} active workers...`
+          );
+          forkWorker(workerId, workerProgress[workerId]?.lastOffset || 0, {
+            workerProgress,
+          });
+        }
+      }
+
+      activeWorkers.delete(worker.id);
+
+      // Check if all records are processed or all workers reported no data
+      const allWorkersCompleted = Object.values(workerProgress).every(
+        (w) => w.completed === true
+      );
+
+      if (totalProcessed >= totalToProcess || allWorkersCompleted) {
+        logger.info("✅ Processing complete. No need to respawn workers.");
+
+        if (activeWorkers.size === 0) {
+          if (totalProcessed === 0 && allWorkersCompleted) {
+            logger.info(
+              "⚠️ No data was processed - all workers reported no data found."
+            );
+          } else {
+            logger.info(
+              `✅ Final progress: ${totalProcessed}/${totalToProcess} items processed.`
+            );
+          }
+          clearProcessingState();
+        }
+      }
+    });
+  }
+
+  function redistributeTasks(failedWorkerId) {
+    logger.warn(`Redistributing tasks for failed worker ${failedWorkerId}`);
+
+    if (workerTasks[failedWorkerId]) {
+      unassignedTasks.push(...workerTasks[failedWorkerId]);
+      delete workerTasks[failedWorkerId];
+    }
+
+    if (activeWorkers.size > 0) {
+      const activeWorkerIds = [...activeWorkers];
+      while (unassignedTasks.length > 0) {
+        const selectedWorkerId =
+          activeWorkerIds[Math.floor(Math.random() * activeWorkerIds.length)];
+        const task = unassignedTasks.pop();
+
+        // Ensure workerTasks exists for the worker
+        if (!workerTasks[selectedWorkerId]) {
+          workerTasks[selectedWorkerId] = [];
+        }
+
+        workerTasks[selectedWorkerId].push(task);
+        cluster.workers[selectedWorkerId]?.send({ type: "assign_task", task });
+      }
+    }
+
+    // Stop workers with no tasks left
+    for (const workerId of activeWorkers) {
+      if (!workerTasks[workerId] || workerTasks[workerId].length === 0) {
+        logger.info(`Worker ${workerId} has no tasks left, stopping.`);
+        cluster.workers[workerId]?.kill();
+        activeWorkers.delete(workerId);
+        delete workerTasks[workerId];
+      }
+    }
+  }
+
+  app.get("/process-data", async (req, res) => {
+    logger.info("Received request to process data.");
+
+    try {
+      // Check for existing processing state
+      const savedState = loadProcessingState();
+
+      // Get total count of records to process
+      const connection = await pool.getConnection();
+      const [result] = await connection.query(
+        "SELECT COUNT(*) AS total FROM currbill1 WHERE isDeleted = '0' AND create_date >= CURDATE()"
+      );
+      connection.release();
+
+      totalToProcess = result[0].total;
+      // totalToProcess = 1600;
+      logger.info(`Total records to process: ${totalToProcess}`);
+
+      // Determine starting point
+      const initialOffset = savedState ? savedState.lastProcessedOffset : 0;
+      logger.info(`Starting processing from offset: ${initialOffset}`);
+
+      for (let i = 0; i < NUM_WORKERS; i++) {
+        forkWorker(i, initialOffset, savedState);
+      }
+
+      res.send(
+        `Processing started for ${totalToProcess} records with ${NUM_WORKERS} workers, starting from offset ${initialOffset}.`
+      );
+    } catch (error) {
+      logger.error(`Error starting processing: ${error.message}`);
+      res.status(500).send(`Error: ${error.message}`);
+    }
+  });
+
+  // Endpoint to reset processing
+  app.get("/reset-processing", (req, res) => {
+    clearProcessingState();
+    res.send("Processing state has been reset.");
+  });
+
+  app.get("/stop-all-workers", (req, res) => {
+    activeWorkers.forEach((workerId) => {
+      const worker = cluster.workers[workerId]; // Get the worker from cluster
+
+      if (worker) {
+        worker.kill(); // Stop the worker process
+        console.log(`Worker ${workerId} stopped.`);
+      }
+
+      activeWorkers.delete(workerId); // Remove from active set
+
+      // Clean up heartbeat intervals
+      if (heartbeatIntervals[workerId]) {
+        clearInterval(heartbeatIntervals[workerId]);
+        delete heartbeatIntervals[workerId];
+      }
+    });
+
+    res.send("All workers stopped.");
+  });
+
+  // Status endpoint
+  app.get("/status", (req, res) => {
+    res.json({
+      activeWorkers: [...activeWorkers],
+      totalProcessed,
+      totalToProcess,
+      unassignedTasks: unassignedTasks.length,
+      percentComplete: totalToProcess
+        ? Math.round((totalProcessed / totalToProcess) * 100)
+        : 0,
+      workerProgress,
+    });
+  });
+
+  // Endpoint: Check worker status
+  app.get("/worker-status", (req, res) => {
+    res.json({
+      activeWorkers: [...activeWorkers],
+      workerTasks,
+    });
+  });
+
+  app.listen(9001, () => logger.info("Master server running on port 9001"));
+  process.on("SIGINT", () => {
+    logger.info("Shutting down gracefully...");
+
+    // Clean up all intervals
+    Object.keys(heartbeatIntervals).forEach((id) => {
+      clearInterval(heartbeatIntervals[id]);
+    });
+
+    pool.end();
+    process.exit(0);
+  });
+} else {
+  // Worker process
+  logger.info(`Worker ${process.pid} started`);
+  let currentBatchSize = FIXED_BATCH_SIZE;
+
+  // Process worker data
+  const processWorkerData = async () => {
+    let connection;
+    try {
+      const workerId = parseInt(process.env.WORKER_ID, 10);
+      const totalRecords = parseInt(process.env.TOTAL_RECORDS, 10);
+      const numWorkers = parseInt(process.env.NUM_WORKERS, 10);
+      const initialOffset = parseInt(process.env.INITIAL_OFFSET, 10) || 0;
+
+      // Calculate worker's portion of records
+      const recordsPerWorker = Math.ceil(totalRecords / numWorkers);
+      const startOffset = Math.max(initialOffset, workerId * recordsPerWorker);
+      const endOffset = Math.min(
+        (workerId + 1) * recordsPerWorker,
+        totalRecords
+      );
+
+      logger.info(
+        `Worker ${workerId}: Processing ${
+          endOffset - startOffset
+        } records from ${startOffset} to ${endOffset}`
+      );
+
+      let processed = 0;
+      let noDataCounter = 0;
+      let processingTimes = [];
+
+      // Listen for batch size adjustment messages
+      process.on("message", (msg) => {
+        if (msg.type === "adjust_batch_size" && msg.batchSize) {
+          currentBatchSize = msg.batchSize;
+          logger.info(
+            `Worker ${workerId} batch size adjusted to ${currentBatchSize}`
+          );
+        }
+      });
+
+      // Process records in batches
+      for (
+        let offset = startOffset;
+        offset < endOffset;
+        offset += currentBatchSize
+      ) {
+        let rows = [];
+        const batchStartTime = Date.now();
+
+        // Notify master process that batch processing is starting
+        process.send({
+          type: "batch_start",
+          workerId,
+          offset,
+        });
+
+        try {
+          connection = await pool.getConnection();
+
+          // Calculate current batch size
+          const effectiveBatchSize = Math.min(
+            currentBatchSize,
+            endOffset - offset
+          );
+
+          // Fetch batch of data
+          [rows] = await connection.query(
+            `SELECT * FROM currbill1 
+               WHERE isDeleted = '0' 
+               AND create_date >= CURDATE() 
+               ORDER BY bill_no 
+               LIMIT ? OFFSET ?`,
+            [effectiveBatchSize, offset]
+          );
+        } catch (error) {
+          logger.error(
+            `Worker ${workerId} error fetching batch: ${error.message}`
+          );
+          throw error;
+        } finally {
+          if (connection) {
+            connection.release();
+            connection = null;
+          }
+        }
+
+        // If no rows were found, track consecutive empty batches
+        if (rows.length === 0) {
+          noDataCounter++;
+          logger.info(
+            `Worker ${workerId}: No records found in batch at offset ${offset}. Empty batch #${noDataCounter}`
+          );
+
+          // After consecutive empty batches, assume no more data for this worker
+          if (noDataCounter >= MAX_CONSECUTIVE_EMPTY_BATCHES) {
+            logger.info(
+              `Worker ${workerId}: No more data to process after ${processed} records.`
+            );
+
+            // Notify the master that this worker found no more data
+            process.send({
+              type: "no_data",
+              workerId,
+              processed,
+              lastOffset: offset,
+            });
+
+            // Exit normally
+            process.exit(0);
+          }
+
+          // Wait before checking next batch
+          await wait(5000);
+          continue;
+        }
+
+        // Reset no-data counter when data is found
+        noDataCounter = 0;
+
+        // Process in chunks with parallelism
+        for (let i = 0; i < rows.length; i += PARALLEL_PROCESSES) {
+          const chunk = rows.slice(i, i + PARALLEL_PROCESSES);
+
+          await Promise.all(
+            chunk.map(async (row) => {
+              try {
+                await processDataAndGeneratePDF(QRcode, PDFDocument, [row]);
+                processed++;
+
+                // Update progress occasionally
+                if (processed % 20 === 0) {
+                  // Report memory usage with progress
+                  const memUsage = process.memoryUsage();
+
+                  process.send({
+                    type: "progress",
+                    workerId,
+                    processed,
+                    lastOffset: offset + i + 1,
+                    memoryUsage: memUsage,
+                  });
+
+                  // Check for high memory usage and force GC if necessary
+                  if (memUsage.heapUsed > MEMORY_THRESHOLD && global.gc) {
+                    logger.info(
+                      `Worker ${workerId} running garbage collection due to high memory usage...`
+                    );
+                    global.gc();
+                  }
+                }
+              } catch (err) {
+                logger.error(
+                  `Error processing row in Worker ${workerId}: ${err.message}`
+                );
+              }
+            })
+          );
+
+          // Short wait between chunks to avoid overwhelming system
+          await wait(2000);
+        }
+
+        // Calculate batch processing time
+        const batchProcessingTime = Date.now() - batchStartTime;
+        processingTimes.push(batchProcessingTime);
+
+        // Keep only the last 5 processing times
+        if (processingTimes.length > 5) processingTimes.shift();
+
+        // Update progress after each batch
+        process.send({
+          type: "progress",
+          workerId,
+          processed,
+          lastOffset: offset + rows.length,
+          batchComplete: true,
+          batchProcessingTime: batchProcessingTime,
+          memoryUsage: process.memoryUsage(),
+        });
+
+        // Wait after batch completion
+        logger.info(
+          `Worker ${workerId} completed batch (took ${Math.round(
+            batchProcessingTime / 1000
+          )}s), waiting ${WAIT_BETWEEN_BATCHES / 1000}s...`
+        );
+        await wait(WAIT_BETWEEN_BATCHES);
+
+        // Force garbage collection (if enabled)
+        if (global.gc) {
+          logger.info(`Worker ${workerId} running garbage collection...`);
+          global.gc();
+        }
+      }
+
+      // If we reached here, we've completed all assigned work
+      logger.info(
+        `Worker ${workerId} finished processing. Total processed: ${processed}`
+      );
+
+      // Notify master we've completed our work
+      process.send({
+        type: "no_data",
+        workerId,
+        processed,
+        lastOffset: endOffset,
+        completed: true,
+      });
+
+      process.exit(0);
+    } catch (error) {
+      logger.error(
+        `Worker ${process.pid} encountered an error: ${error.message}`
+      );
+      process.exit(1);
+    }
+  };
+
+  // Start processing
+  processWorkerData();
+}
+
+function wait(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+module.exports = {
+  saveProcessingState,
+  loadProcessingState,
+  clearProcessingState,
+};
