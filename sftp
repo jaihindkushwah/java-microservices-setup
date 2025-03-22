@@ -1,0 +1,156 @@
+const fs = require('fs');
+const path = require('path');
+const { Client } = require('ssh2');
+const { Worker: BullWorker, Queue } = require('bullmq');
+const { cpus } = require('os');
+const PDFDocument = require('pdfkit');
+
+const numCores = cpus().length;
+const concurrency = Math.min(10, numCores * 2); // Auto-scale concurrency
+
+const config = {
+    host: 'sftp.example.com',
+    port: 22,
+    username: 'your_username',
+    password: 'your_password'
+};
+
+const localFolder = './downloaded_images/';
+const pdfOutputFolder = './generated_pdfs/';
+
+// Ensure directories exist
+[localFolder, pdfOutputFolder].forEach(folder => fs.mkdirSync(folder, { recursive: true }));
+
+// 🚀 Create an SFTP Connection Pool
+const sftpPool = [];
+async function createSFTPConnection() {
+    return new Promise((resolve, reject) => {
+        const conn = new Client();
+        conn.on('ready', () => {
+            conn.sftp((err, sftp) => {
+                if (err) {
+                    conn.end();
+                    reject(err);
+                } else {
+                    resolve({ conn, sftp });
+                }
+            });
+        }).connect(config);
+    });
+}
+
+// 🌟 Preload SFTP Connections for Parallel Jobs
+(async function preloadSFTPConnections() {
+    for (let i = 0; i < concurrency; i++) {
+        sftpPool.push(await createSFTPConnection());
+    }
+    console.log(`✅ Preloaded ${sftpPool.length} SFTP connections`);
+})();
+
+// Function to get an available SFTP connection
+function getSFTPConnection() {
+    return sftpPool.pop() || createSFTPConnection();
+}
+
+// Function to return an SFTP connection to the pool
+function returnSFTPConnection(connObj) {
+    sftpPool.push(connObj);
+}
+
+// Function to download images from SFTP
+async function downloadImage(remotePath, localPath) {
+    const connObj = await getSFTPConnection();
+    const { conn, sftp } = connObj;
+
+    return new Promise((resolve, reject) => {
+        const remoteStream = sftp.createReadStream(remotePath);
+        const localStream = fs.createWriteStream(localPath);
+
+        remoteStream.pipe(localStream);
+        localStream.on('finish', () => {
+            returnSFTPConnection(connObj); // Return connection to pool
+            resolve(`✅ Downloaded: ${localPath}`);
+        });
+
+        remoteStream.on('error', err => {
+            conn.end(); // Close bad connection
+            reject(err);
+        });
+        localStream.on('error', reject);
+    });
+}
+
+// Function to generate PDFs
+async function generatePDF(imagePath, pdfPath) {
+    return new Promise((resolve, reject) => {
+        const doc = new PDFDocument({ size: 'A4' });
+        const stream = fs.createWriteStream(pdfPath);
+
+        doc.pipe(stream);
+        doc.image(imagePath, { fit: [500, 400], align: 'center', valign: 'center' });
+        doc.text('Generated PDF with SFTP Image', { align: 'center' });
+        doc.end();
+
+        stream.on('finish', () => {
+            fs.unlinkSync(imagePath); // Cleanup image after processing
+            resolve(`✅ PDF Created: ${pdfPath}`);
+        });
+
+        stream.on('error', reject);
+    });
+}
+
+// 🎯 Create a Redis Queue to Manage Jobs
+const queue = new Queue('image-processing', { connection: { host: '127.0.0.1', port: 6379 } });
+
+/*  
+===========================
+🚀 PRODUCER - Add Jobs to Queue
+===========================
+*/
+async function addJobsToQueue(imagePaths) {
+    for (const image of imagePaths) {
+        await queue.add('process-image', { image });
+        console.log(`📤 Job Added: ${image}`);
+    }
+}
+
+// Example usage: Add images to queue
+const sampleImages = [
+    '/remote_folder/image1.jpg',
+    '/remote_folder/image2.jpg',
+    '/remote_folder/image3.jpg'
+];
+
+addJobsToQueue(sampleImages).then(() => {
+    console.log('🚀 All jobs added to the queue!');
+});
+
+/*  
+===========================
+🏭 CONSUMER - Process Jobs
+===========================
+*/
+new BullWorker(
+    'image-processing',
+    async job => {
+        try {
+            const remotePath = job.data.image;
+            const localPath = path.join(localFolder, path.basename(remotePath));
+            const pdfPath = path.join(pdfOutputFolder, `${path.basename(remotePath, '.jpg')}.pdf`);
+
+            await downloadImage(remotePath, localPath);
+            await generatePDF(localPath, pdfPath);
+
+            console.log(`✅ Completed: ${pdfPath}`);
+        } catch (error) {
+            console.error('❌ Error:', error);
+        }
+    },
+    {
+        connection: { host: '127.0.0.1', port: 6379 },
+        concurrency // Dynamic concurrency to scale across CPU cores
+    }
+);
+
+console.log(`✅ Worker Started with Concurrency: ${concurrency}`);
