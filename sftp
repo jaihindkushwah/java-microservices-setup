@@ -154,3 +154,48 @@ new BullWorker(
 );
 
 console.log(`✅ Worker Started with Concurrency: ${concurrency}`);
+
+
+
+//=============================================================
+
+
+
+const { PDFDocument, rgb } = require('pdf-lib');
+const fs = require('fs');
+
+async function generatePDF(imagePath, pdfPath) {
+    try {
+        const pdfDoc = await PDFDocument.create();
+        const page = pdfDoc.addPage([595, 842]); // A4 Size [width, height]
+
+        // Load image as bytes
+        const imageBytes = fs.readFileSync(imagePath);
+        const image = await pdfDoc.embedJpg(imageBytes); // If PNG, use embedPng
+
+        // Calculate position for center alignment
+        const { width, height } = image.scaleToFit(500, 400);
+        const x = (page.getWidth() - width) / 2;
+        const y = (page.getHeight() - height) / 2;
+
+        // Draw image & text
+        page.drawImage(image, { x, y, width, height });
+        page.drawText('Generated PDF with SFTP Image', {
+            x: 180,
+            y: 50,
+            size: 16,
+            color: rgb(0, 0, 0),
+        });
+
+        // Write PDF to file
+        const pdfBytes = await pdfDoc.save();
+        fs.writeFileSync(pdfPath, pdfBytes);
+
+        // Delete image after processing
+        fs.unlinkSync(imagePath);
+
+        return `✅ PDF Created: ${pdfPath}`;
+    } catch (error) {
+        throw new Error(`❌ PDF Generation Failed: ${error.message}`);
+    }
+}
